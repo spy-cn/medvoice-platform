@@ -189,8 +189,8 @@ if __name__ == "__main__":
     try:
         video_to_audio = VideoToAudio()
         result = video_to_audio.extract_audio(
-            video_path=r'E:\code_project\medvoice-recognition-platform\data\video\叶问.mp4',
-            output_path=r'E:\code_project\medvoice-recognition-platform\data\audio\origin_audio\叶问.wav',
+            video_path=r'/Users/spy/Documents/codes/python_code/medvoice-platform/data/video/叶问.mp4',
+            output_path=r'/Users/spy/Documents/codes/python_code/medvoice-platform/data/audio/origin_audio/叶问.wav',
             output_format='wav',
             sample_rate=48000,  # 自定义采样率
             audio_channels=2  # 单声道

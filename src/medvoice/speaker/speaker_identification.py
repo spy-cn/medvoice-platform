@@ -13,7 +13,9 @@ from pydub import AudioSegment
 from sklearn.metrics.pairwise import cosine_similarity
 
 from src.medvoice.utils import audio_utils
+from src.medvoice.utils.code_generator import CodeGenerator
 from src.medvoice.utils.logger_utils import setup_logger
+from src.medvoice.utils.mysql_connection_utils import MySQLConnectionUtil
 
 static_ffmpeg.add_paths()
 
@@ -24,6 +26,13 @@ logger = setup_logger('SpeakerIdentification', level=logging.DEBUG)
 project_root = Path(__file__).resolve().parents[3]  # 调整层级
 sys.path.append(str(project_root))
 
+db_util = MySQLConnectionUtil(
+    host='localhost',
+    user='root',
+    password='123456',
+    database='medvoice_identity',
+)
+
 
 @dataclass
 class SpeakerSegment:
@@ -33,7 +42,7 @@ class SpeakerSegment:
     text: str  # 识别文本
     spk_code: str  # 说话人编码
     spk_name: str  # 说话人姓名
-    speaker_id: str  # 说话人ID
+    spk_id: str  # 说话人ID
     audio_path: str  # 音频文件路径
     similarity: float  # 相似度得分
 
@@ -46,7 +55,7 @@ class SpeakerIdentification:
         self.speaker_names = {}  # 说话人ID到姓名的映射
         self.speaker_counter = 1  # 说话人计数器
         self.similarity_threshold = 0.7  # 相似度阈值
-        self.temp_dir = r"E:\code_project\medvoice-recognition-platform\data\audio"
+        self.temp_dir = r"/Users/spy/Documents/codes/python_code/medvoice-platform/data/audio"
 
     def init_models(self):
         """初始化所有模型"""
@@ -226,6 +235,7 @@ class SpeakerIdentification:
             # 说话人分离
             res = self.asr_model.generate(
                 input=audio_path,
+                language="auto",
                 batch_size_s=300,
                 hotword=hotword
             )
@@ -275,24 +285,105 @@ class SpeakerIdentification:
     def _register_or_update_speaker(self, speaker_name: str, embedding: np.ndarray) -> str:
         """
         注册或者更新说话人
-        :param speaker_name:  说话人姓名
-        :param embedding:  声纹向量
-        :return:
+        :param speaker_name: 说话人姓名
+        :param embedding: 声纹向量
+        :return: 说话人编码
         """
-        # 检查是否已经存在此说话人
+        # 初始化编码生成器和数据库连接
+        generator = CodeGenerator(prefix="SPK_")
+        spk_code = generator.generate_code(speaker_name, use_timestamp=False)
+
+        if not db_util.connect():
+            logger.error("数据库连接失败，使用本地存储")
+            # 如果数据库连接失败，回退到本地存储逻辑
+            return self._fallback_local_storage(speaker_name, embedding)
+
+        try:
+            # 检查是否已经存在此说话人（通过姓名）
+            check_sql = "SELECT spk_code, voiceprint_data FROM user_voiceprints WHERE spk_name = %s"
+            result = db_util.execute_query(check_sql, (speaker_name,))
+
+            print(f"=============:{result}")
+
+            if result and len(result) > 0:
+                # 存在现有说话人，进行更新
+                existing_code = result[0]['spk_code']
+                old_embedding_blob = result[0]['embedding']
+
+                # 将数据库中的BLOB数据转换回numpy数组
+                old_embedding = np.frombuffer(old_embedding_blob, dtype=np.float32)
+
+                # 指数平滑更新声纹向量
+                updated_embedding = 0.7 * embedding + 0.3 * old_embedding
+                updated_embedding = updated_embedding / np.linalg.norm(updated_embedding)
+
+                # 将更新后的向量转换为BLOB格式
+                updated_embedding_blob = updated_embedding.astype(np.float32).tobytes()
+
+                # 更新数据库
+                update_sql = """
+                             UPDATE user_voiceprints
+                             SET voiceprint_data   = %s, \
+                                 upt = NOW()
+                             WHERE spk_code = %s \
+                             """
+                db_util.execute_update(update_sql, (updated_embedding_blob, existing_code))
+
+                # 同时更新本地缓存
+                self.speaker_profiles[existing_code] = updated_embedding
+                self.speaker_names[existing_code] = speaker_name
+
+                logger.info(f"已更新说话人: {speaker_name} (CODE: {existing_code})")
+                return existing_code
+            else:
+                # 新注册说话人
+                # 确保编码在数据库中也不重复
+                final_spk_code = spk_code
+                #self._ensure_unique_code(db_util, spk_code, speaker_name)
+
+                # 将声纹向量转换为BLOB格式
+                embedding_blob = embedding.astype(np.float32).tobytes()
+
+                # 插入新记录
+                insert_sql = """
+                             INSERT INTO user_voiceprints
+                                 (spk_code, spk_name, voiceprint_data, crt, upt)
+                             VALUES (%s, %s, %s, NOW(), NOW()) \
+                             """
+                db_util.execute_update(insert_sql, (final_spk_code, speaker_name, embedding_blob))
+
+                # 更新本地缓存
+                self.speaker_profiles[final_spk_code] = embedding
+                self.speaker_names[final_spk_code] = speaker_name
+                self.speaker_counter += 1
+
+                logger.info(f"已注册新说话人: {speaker_name} (CODE: {final_spk_code})")
+                return final_spk_code
+
+        except Exception as e:
+            logger.error(f"数据库操作失败: {e}")
+            # 数据库操作失败时回退到本地存储
+            return self._fallback_local_storage(speaker_name, embedding)
+
+
+    def _fallback_local_storage(self, speaker_name: str, embedding: np.ndarray) -> str:
+        """
+        数据库连接失败时的回退方案，使用本地存储
+        """
+        # 检查本地是否已存在
         existing_code = None
         for spk_code, name in self.speaker_names.items():
             if name == speaker_name:
                 existing_code = spk_code
                 break
+
         if existing_code:
-            # 更新现有说话人（指数平滑更新）
+            # 更新现有说话人
             old_embedding = self.speaker_profiles[existing_code]
             updated_embedding = 0.7 * embedding + 0.3 * old_embedding
             updated_embedding = updated_embedding / np.linalg.norm(updated_embedding)
-
             self.speaker_profiles[existing_code] = updated_embedding
-            logger.info(f"已更新说话人: {speaker_name} (CODE: {existing_code})")
+            logger.info(f"本地存储已更新说话人: {speaker_name} (CODE: {existing_code})")
             return existing_code
         else:
             # 新注册
@@ -300,7 +391,7 @@ class SpeakerIdentification:
             self.speaker_counter += 1
             self.speaker_profiles[spk_code] = embedding
             self.speaker_names[spk_code] = speaker_name
-            logger.info(f"已注册新说话人: {speaker_name} (CODE: {spk_code})")
+            logger.info(f"本地存储已注册新说话人: {speaker_name} (CODE: {spk_code})")
             return spk_code
 
     def _process_single_segment(self, sentence_info: dict, audio: AudioSegment,
@@ -333,9 +424,9 @@ class SpeakerIdentification:
                 start_time=start_time,
                 end_time=end_time,
                 text=text,
-                speaker_id=spk_id,
+                spk_id=spk_id,
                 spk_code="",
-                spk_name=spk_id,
+                spk_name="",
                 audio_path=segment_path,
                 similarity=0.0
             )
@@ -345,40 +436,164 @@ class SpeakerIdentification:
 
     def _identify_speakers_in_segments(self, speaker_segments: List[SpeakerSegment]) -> List[SpeakerSegment]:
         """
-        识别片段中的说话人
-        :param speaker_segments:
-        :return:
+        识别片段中的说话人 - 优化版本，确保spk_id到spk_code的一对一映射
+        未识别的说话人命名为陌生人、陌生人1、陌生人2...
         """
         identified_segments = []
-        spk_map = {}
-        max_similarity_map = {}
+        spk_mapping = {}  # 原始speaker_id -> 注册spk_code的映射
+        spk_code_used = set()  # 记录已经被使用的spk_code，避免重复分配
+        spk_id_to_segments = {}  # 记录每个spk_id对应的所有片段和embedding
+        unknown_counter = 0  # 陌生人计数器
+        unknown_mapping = {}  # spk_id -> 陌生人名称的映射
+
+        # 第一阶段：收集所有spk_id的信息
         for segment in speaker_segments:
+            spk_id = segment.spk_id
+            if spk_id not in spk_id_to_segments:
+                spk_id_to_segments[spk_id] = {
+                    'segments': [],
+                    'embeddings': [],
+                    'durations': []
+                }
 
             query_embedding = self._extract_voiceprint_embedding(segment.audio_path)
-            if query_embedding is None:
-                logger.warning(f"未识别到说话人ID:{segment.audio_path}")
-                segment.speaker_id = "unknown"
+            spk_id_to_segments[spk_id]['segments'].append(segment)
+            spk_id_to_segments[spk_id]['embeddings'].append(query_embedding)
+            spk_id_to_segments[spk_id]['durations'].append(segment.end_time - segment.start_time)
+
+        # 第二阶段：为每个spk_id确定最佳的spk_code
+        for spk_id, data in spk_id_to_segments.items():
+            segments = data['segments']
+            embeddings = data['embeddings']
+            durations = data['durations']
+
+            # 统计每个候选spk_code的出现次数和平均相似度
+            candidate_scores = {}
+            valid_embeddings_count = 0  # 有效embedding的数量
+
+            for i, (embedding, duration) in enumerate(zip(embeddings, durations)):
+                if embedding is None:
+                    continue
+
+                valid_embeddings_count += 1
+                dynamic_threshold = self._get_dynamic_threshold(duration)
+                best_match_spk_code, best_score = self._match_against_voiceprint_library(
+                    embedding, dynamic_threshold
+                )
+
+                if best_match_spk_code and best_score >= dynamic_threshold:
+                    if best_match_spk_code not in candidate_scores:
+                        candidate_scores[best_match_spk_code] = {
+                            'count': 0,
+                            'total_score': 0.0,
+                            'best_score': 0.0
+                        }
+
+                    candidate_scores[best_match_spk_code]['count'] += 1
+                    candidate_scores[best_match_spk_code]['total_score'] += best_score
+                    candidate_scores[best_match_spk_code]['best_score'] = max(
+                        candidate_scores[best_match_spk_code]['best_score'], best_score
+                    )
+
+            # 选择最佳的spk_code
+            best_spk_code = None
+
+            if candidate_scores:
+                # 策略：优先选择出现次数多的，次数相同时选择平均相似度高的
+                best_candidate = max(
+                    candidate_scores.items(),
+                    key=lambda x: (x[1]['count'], x[1]['total_score'] / x[1]['count'])
+                )
+                best_spk_code = best_candidate[0]
+
+                # 检查该spk_code是否已经被其他spk_id使用
+                if best_spk_code in spk_code_used:
+                    logger.warning(f"spk_code {best_spk_code} 已被其他说话人使用，为spk_id {spk_id} 分配陌生人名称")
+                    best_spk_code = None
+                else:
+                    spk_code_used.add(best_spk_code)
+
+            # 如果没有找到合适的spk_code，分配陌生人名称
+            if best_spk_code is None:
+                if valid_embeddings_count == 0:
+                    # 所有embedding都无效，分配陌生人名称
+                    if spk_id not in unknown_mapping:
+                        if unknown_counter == 0:
+                            unknown_mapping[spk_id] = "陌生人"
+                        else:
+                            unknown_mapping[spk_id] = f"陌生人{unknown_counter}"
+                        unknown_counter += 1
+                    best_spk_code = unknown_mapping[spk_id]
+                else:
+                    # 有有效embedding但未匹配到任何人，分配陌生人名称
+                    if spk_id not in unknown_mapping:
+                        if unknown_counter == 0:
+                            unknown_mapping[spk_id] = "陌生人"
+                        else:
+                            unknown_mapping[spk_id] = f"陌生人{unknown_counter}"
+                        unknown_counter += 1
+                    best_spk_code = unknown_mapping[spk_id]
+
+            spk_mapping[spk_id] = best_spk_code
+
+        # 第三阶段：为所有片段分配spk_code
+        for spk_id, data in spk_id_to_segments.items():
+            segments = data['segments']
+            embeddings = data['embeddings']
+            durations = data['durations']
+            assigned_spk_code = spk_mapping[spk_id]
+
+            for i, (segment, embedding, duration) in enumerate(zip(segments, embeddings, durations)):
+                if embedding is None:
+                    segment.spk_code = assigned_spk_code
+                    segment.similarity = 0.0
+                else:
+                    dynamic_threshold = self._get_dynamic_threshold(duration)
+                    best_match_spk_code, best_score = self._match_against_voiceprint_library(
+                        embedding, dynamic_threshold
+                    )
+
+                    # 使用统一的spk_code，但保留当前片段的相似度
+                    segment.spk_code = assigned_spk_code
+                    # 如果当前片段匹配到的spk_code与分配的一致，使用实际相似度，否则为0
+                    if best_match_spk_code == assigned_spk_code:
+                        segment.similarity = best_score
+                    else:
+                        segment.similarity = 0.0
+
                 identified_segments.append(segment)
-                continue
-            duration = segment.end_time - segment.start_time
-            dynamic_threshold = self._get_dynamic_threshold(duration)
-            best_match_spk_code, best_score = self._match_against_voiceprint_library(query_embedding, dynamic_threshold)
-            if best_match_spk_code:
-                spk_map[segment.speaker_id] = best_match_spk_code
-                segment.spk_code = best_match_spk_code
-                segment.similarity = best_score
-                # 更新spk_map，只保留相似度最大的映射
-                if segment.speaker_id and segment.speaker_id != "unknown":
-                    current_max_similarity = max_similarity_map.get(segment.speaker_id, -1)
-                    if best_score > current_max_similarity:
-                        spk_map[segment.speaker_id] = best_match_spk_code
-                        max_similarity_map[segment.speaker_id] = best_score
-                        logger.debug(f"更新映射: {segment.speaker_id} -> {best_match_spk_code}, 相似度: {best_score}")
-            else:
-                segment.spk_code = spk_map.get(segment.speaker_id, "unknown")
-                segment.similarity = best_score
-            identified_segments.append(segment)
-        print(f"======================:{spk_map}")
+
+        for segment in identified_segments:
+            print(segment)
+            # insert_sql = """
+            #              INSERT INTO audio_recognition_records (speaker_id, speaker_code, speaker_name, speech_time, \
+            #                                                     speech_content, emotion, emotion_confidence, \
+            #                                                     audio_file_path, \
+            #                                                     audio_duration, recognition_confidence, \
+            #                                                     recognition_time, \
+            #                                                     crt, upt) \
+            #              VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW()) \
+            #              """
+            #
+            # params = (
+            #     segment.spk_id,
+            #     segment.spk_code,
+            #     segment.speaker_name,
+            #     segment.speech_time,
+            #     segment.text or "",
+            #     segment.emotion or "neutral",
+            #     segment.emotion_confidence or 0.0,
+            #     segment.audio_path,
+            #     segment.end_time - segment.start_time,
+            #     segment.similarity or 0.0,
+            #     segment.audio_duration or 0.0,
+            # )
+            # db_util.execute_update(insert_sql, params)
+        logger.debug(f"所有说话人的ID: {set(spk_id_to_segments.keys())}")
+        logger.debug(f"说话人映射关系: {spk_mapping}")
+        logger.debug(f"已使用的spk_code: {spk_code_used}")
+        logger.debug(f"陌生人映射: {unknown_mapping}")
+
         return identified_segments
 
     def _get_dynamic_threshold(self, duration: float) -> float:
@@ -430,59 +645,9 @@ class SpeakerIdentification:
                 logger.debug(f"✅ 识别到: {speaker_name} (相似度: {segment.similarity:.3f})")
             else:
                 logger.debug(f"❌ 未识别 (最高相似度: {segment.similarity:.3f})")
-            logger.debug(f"说话人ID：: {segment.speaker_id}")
+            logger.debug(f"说话人ID：: {segment.spk_id}")
             logger.debug(f"说话人CODE：: {segment.spk_code}")
             logger.debug(f"时间: {segment.start_time / 1000:.2f}s - {segment.end_time / 1000:.2f}s")
             logger.debug(f"内容: {segment.text}")
             logger.debug(f"音频路径: {segment.audio_path}")
             logger.debug("-" * 40)
-
-
-if __name__ == "__main__":
-    spkIdent = SpeakerIdentification()
-    spkIdent.init_models()
-    speakers_data = {
-        "叶问老婆": [
-            r'E:\code_project\medvoice-recognition-platform\data\audio\voiceprint_lib\叶问老婆1.wav',
-            r'E:\code_project\medvoice-recognition-platform\data\audio\voiceprint_lib\叶问老婆2.wav',
-            r'E:\code_project\medvoice-recognition-platform\data\audio\voiceprint_lib\叶问老婆3.wav',
-            r'E:\code_project\medvoice-recognition-platform\data\audio\voiceprint_lib\叶问老婆4.wav',
-        ],
-        # "叶问": [
-        #     r'E:\code_project\medvoice-recognition-platform\data\audio\voiceprint_lib\叶问1.wav',
-        #     r'E:\code_project\medvoice-recognition-platform\data\audio\voiceprint_lib\叶问2.wav',
-        #     r'E:\code_project\medvoice-recognition-platform\data\audio\voiceprint_lib\叶问3.wav',
-        # ],
-        "叶问讲解者": [
-            r'E:\code_project\medvoice-recognition-platform\data\audio\voiceprint_lib\叶问讲解者1.wav',
-            r'E:\code_project\medvoice-recognition-platform\data\audio\voiceprint_lib\叶问讲解者2.wav',
-            r'E:\code_project\medvoice-recognition-platform\data\audio\voiceprint_lib\叶问讲解者3.wav',
-            r'E:\code_project\medvoice-recognition-platform\data\audio\voiceprint_lib\叶问讲解者4.wav',
-            r'E:\code_project\medvoice-recognition-platform\data\audio\voiceprint_lib\叶问讲解者5.wav',
-            r'E:\code_project\medvoice-recognition-platform\data\audio\voiceprint_lib\叶问讲解者6.wav',
-        ],
-        "路人": [
-            r'E:\code_project\medvoice-recognition-platform\data\audio\voiceprint_lib\路人1.wav',
-            r'E:\code_project\medvoice-recognition-platform\data\audio\voiceprint_lib\路人2.wav',
-        ],
-        "金山爪": [
-            r'E:\code_project\medvoice-recognition-platform\data\audio\voiceprint_lib\金山爪0.wav',
-            r'E:\code_project\medvoice-recognition-platform\data\audio\voiceprint_lib\金山爪1.wav',
-            r'E:\code_project\medvoice-recognition-platform\data\audio\voiceprint_lib\金山爪2.wav',
-            r'E:\code_project\medvoice-recognition-platform\data\audio\voiceprint_lib\金山爪3.wav',
-            r'E:\code_project\medvoice-recognition-platform\data\audio\voiceprint_lib\金山爪.wav',
-        ]
-    }
-    for speaker_name, audio_paths in speakers_data.items():
-        spk_code = spkIdent.collect_speaker_voiceprints(speaker_name, audio_paths, min_audio_count=2,
-                                                        quality_threshold=0.4)
-        if spk_code:
-            logger.info(f"✅ 成功注册: {speaker_name} -> {spk_code}")
-        else:
-            logger.error(f"❌ 注册失败: {speaker_name}")
-    target_audio = r"E:\code_project\medvoice-recognition-platform\data\audio\origin_audio\叶问.wav"
-    if os.path.exists(target_audio):
-        segments = spkIdent.process_audio_with_spk_diarization(target_audio)
-        logger.debug(f"处理完成，共识别 {len(segments)} 个语音片段")
-    else:
-        logger.debug(f"目标音频文件不存在: {target_audio}")
